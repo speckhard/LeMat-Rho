@@ -10,11 +10,11 @@ Parquet rows are read on-the-fly in __getitem__. Each DataLoader worker caches
 opened tables per chunk file so each file is read from disk only once per worker.
 """
 
+import collections
 import json
 import sys
 from functools import partial
 from pathlib import Path
-from typing import Optional
 
 import ase
 import ase.data
@@ -38,9 +38,9 @@ if not _CHARGE3NET_ROOT.exists():
 if str(_CHARGE3NET_ROOT) not in sys.path:
     sys.path.insert(0, str(_CHARGE3NET_ROOT))
 
-from src.charge3net.data.collate import collate_list_of_dicts  # noqa: E402
-from src.charge3net.data.graph_construction import KdTreeGraphConstructor  # noqa: E402
-from src.utils.data import calculate_grid_pos  # noqa: E402
+from src.charge3net.data.collate import collate_list_of_dicts
+from src.charge3net.data.graph_construction import KdTreeGraphConstructor
+from src.utils.data import calculate_grid_pos
 
 # Columns we actually need from Parquet
 _COLUMNS = [
@@ -55,10 +55,20 @@ _COLUMNS = [
 # ---------------------------------------------------------------------------
 _SYMBOL_TO_Z = {s: z for z, s in enumerate(ase.data.chemical_symbols)}
 
-# Process-local table cache: keyed by file index, populated on first access.
-# Each DataLoader worker process has its own cache, so each chunk file is read
-# from disk at most once per worker instead of once per __getitem__ call.
-_TABLE_CACHE: dict = {}
+# Process-local LRU table cache: keyed by file index, populated on first access.
+# Each DataLoader worker has its own cache (workers fork the parent), so each
+# chunk file is read from disk at most once per worker per cache cycle.
+#
+# Bounded LRU because the previous unbounded version OOM-killed jobs 4971293
+# and 4971343 at MaxRSS=35 GB/rank. Per-chunk decompressed pyarrow tables
+# weigh ~2 GB (the compressed_charge_density JSON strings inflate 6x from
+# disk). With 8 workers x 4 DDP ranks = 32 workers, an unbounded cache grew
+# to ~140 GB total in 6 h.
+#
+# Cap of 5 chunks per worker keeps each worker's cache around 10 GB worst
+# case, well under any per-rank memory budget. OrderedDict gives O(1) LRU.
+_TABLE_CACHE_MAX_CHUNKS = 5
+_TABLE_CACHE: "collections.OrderedDict[int, object]" = collections.OrderedDict()
 
 
 def _parse_grid_json(json_str: str) -> np.ndarray:
@@ -131,7 +141,9 @@ def _build_parquet_index(parquet_dir: Path) -> tuple:
                 index.append((fi, ri))
 
     n_valid = len(index)
-    print(f"LeMatRhoDataset: {n_valid}/{n_total} valid rows indexed from {len(file_paths)} files")
+    print(
+        f"LeMatRhoDataset: {n_valid}/{n_total} valid rows indexed from {len(file_paths)} files"
+    )
     return file_paths, index
 
 
@@ -160,10 +172,10 @@ class LeMatRhoDataset(Dataset):
 
     def __init__(
         self,
-        parquet_dir: str = None,
+        parquet_dir: str | None = None,
         cutoff: float = 4.0,
-        num_probes: Optional[int] = None,
-        _shared_index: tuple = None,
+        num_probes: int | None = None,
+        _shared_index: tuple | None = None,
     ):
         self.cutoff = cutoff
         self.num_probes = num_probes
@@ -186,11 +198,21 @@ class LeMatRhoDataset(Dataset):
         """
         Read a single row from disk via its index entry.
 
-        Uses a process-local cache (_TABLE_CACHE) so each chunk file is
-        loaded from disk only once per worker, not on every __getitem__ call.
+        Uses a process-local LRU cache (_TABLE_CACHE) so each chunk file is
+        loaded from disk at most once per worker per cache cycle. Cache is
+        capped at _TABLE_CACHE_MAX_CHUNKS entries; on a miss past capacity
+        the least-recently-used chunk is evicted. Re-access of a present
+        entry promotes it to most-recent so the running shuffled-access
+        pattern from RandomSampler doesn't constantly thrash.
         """
         fi, ri = self._index[idx]
-        if fi not in _TABLE_CACHE:
+        if fi in _TABLE_CACHE:
+            # Hit: bump to most-recent and return.
+            _TABLE_CACHE.move_to_end(fi)
+        else:
+            # Miss: evict LRU if at capacity, then read.
+            if len(_TABLE_CACHE) >= _TABLE_CACHE_MAX_CHUNKS:
+                _TABLE_CACHE.popitem(last=False)
             _TABLE_CACHE[fi] = pq.read_table(self._file_paths[fi], columns=_COLUMNS)
         table = _TABLE_CACHE[fi]
         row = {}
@@ -230,6 +252,7 @@ def build_dataloaders(
     num_workers: int = 4,
     seed: int = 42,
     pin_memory: bool = False,
+    distributed: bool = False,
 ) -> tuple:
     """
     Build train, validation, and test DataLoaders.
@@ -298,10 +321,27 @@ def build_dataloaders(
 
     collate_fn = partial(collate_list_of_dicts, pin_memory=pin_memory)
 
+    # DDP path: shard the training set across ranks via DistributedSampler.
+    # Val/test stay non-distributed (each rank evaluates the whole set; only
+    # rank 0 reports). This wastes V+T compute but keeps eval simple and
+    # rank-agnostic. The data is tiny (5%+5% of 65k) so it's fine.
+    train_sampler = None
+    if distributed:
+        from torch.utils.data.distributed import DistributedSampler
+
+        train_sampler = DistributedSampler(
+            train_subset,
+            shuffle=True,
+            seed=seed,
+            drop_last=True,
+        )
+
     train_loader = DataLoader(
         train_subset,
         batch_size=batch_size,
-        shuffle=True,
+        # shuffle and sampler are mutually exclusive in DataLoader.
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
         num_workers=num_workers,
         collate_fn=collate_fn,
         pin_memory=pin_memory,
